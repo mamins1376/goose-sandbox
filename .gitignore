@@ -1,0 +1,10 @@
+# Your provider credentials. The README tells you to create this from
+# goose.env.example; it must never be committed.
+goose.env
+
+# Exported image archives (podman save / docker save).
+*.tar
+*.tar.gz
+
+# Scratch directories.
+/tmp/
