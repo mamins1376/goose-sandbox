@@ -91,6 +91,17 @@ Consequences worth knowing:
   neither is needed.
 - **No telemetry, and no consent prompt** — the prompt is part of the
   `telemetry` feature, so a fresh container goes straight to the session.
+- **A new session costs one extra LLM call.** At the start of each turn
+  `agent.rs` spawns a background task that asks the provider to *name* the
+  session, sending the first three user-visible user messages plus the
+  working-folder name (`session/session_manager.rs`). It is a second,
+  concurrent stream against the same provider, so it consumes its own
+  first-line budget and can retry on its own; it stops once the session has
+  more than three user messages. It sends nothing the turn itself does not
+  already send, but it is a second request on your account. Set
+  `GOOSE_DISABLE_SESSION_NAMING=true` to turn it off — the `config_value!` macro
+  looks up the upper-cased key in the environment first, so the env var alone is
+  enough, no config file needed. The only loss is automatic session titles.
 
 The build then *verifies* the llama.cpp claim rather than assuming it: it greps
 its own binary for `ggml` and fails if the count is not zero. With
@@ -339,27 +350,67 @@ cd test && ./run-tests.sh
 ```
 
 ```
-==> A: 20 s prefill, default budgets (expect success)
+==> running A-F in parallel (each case is one container)
+==> A: 17 s prefill, default budgets (expect success)
+      [mockslow: 17s]
   PASS  slow prefill survives
-==> B: same 20 s prefill, first-line budget forced to 5 s (expect failure naming 5s)
+==> B: same 17 s prefill, first-line budget forced to 2 s (expect failure naming 2s)
+      [mockslow: 8s]
   PASS  budget is live
-==> C: provider-level override stream_first_line_timeout_secs=3 (expect failure naming 3s)
+==> C: provider-level override stream_first_line_timeout_secs=1 (expect failure naming 1s)
+      [mockfastline: 4s]
   PASS  per-provider override reaches the timer
-==> D: stall after the first chunk (expect the idle message, not the prefill one)
+==> D: stall after the first chunk, 3 s window (expect the idle message, not the prefill one)
+      [mockdead: 3s]
   PASS  idle window unchanged
-==> E: 6 s of silence AFTER the headers, budget 1 s (expect the timer to fire)
+==> E: 2 s of silence AFTER the headers, budget 1 s (expect the timer to fire)
+      [mockpre2: 4s]
   PASS  silence after headers is measured
-==> F: the SAME 6 s of silence BEFORE the headers, budget 1 s (expect it to be invisible)
+==> F: the SAME 2 s of silence BEFORE the headers, budget 1 s (expect it to be invisible)
+      [mockhdr2: 2s]
   PASS  silence before headers is NOT measured
   PASS    ...and the request still completes
 
-7 passed, 0 failed          (about two minutes)
+7 passed, 0 failed
+total wall clock: 17s
 ```
 
-Case B is the one that matters. Case A alone proves nothing: "the 20 s prefill
+The per-case lines overlap — the six cases run at once — so only the total is
+wall clock.
+
+### Why the suite is fast, and what it costs
+
+An earlier revision of this script took 101 s. Three changes brought it to ~17 s
+without touching a single assertion:
+
+- **The cases run in parallel.** They were always independent — own port, own
+  `GOOSE_PATH_ROOT`, own container — and the mock is a `ThreadingHTTPServer`, so
+  the suite costs `max(case)` rather than `sum(case)`. The price is that the
+  per-case timings are no longer additive and that the tiny budgets sit on a
+  busier host; if you ever see a one-second budget flap, raise it rather than
+  blaming goose.
+- **`GOOSE_PROVIDER_SKIP_BACKOFF=true`.** A first-line timeout is a
+  `ProviderError::NetworkError` raised before the stream's first item, so
+  `agents/reply_parts.rs` retries it — `RetryConfig::default()` is 3 retries with
+  1 s / 2 s / 4 s backoff. The retries still happen (the same error is still
+  asserted), but the 7 s of sleeping per case is skipped: ~21 s of the old
+  runtime. Nothing here asserts pacing.
+- **The budgets and mock delays are as small as still discriminating.** A
+  timed-out case costs 4 × budget, so the budget *is* the multiplier; each one
+  only has to sit below the delay it is meant to catch. Keep them at 1 s or
+  above — below that you are measuring the scheduler, not goose — and do not take
+  A below 16 s, because it must stay above the 15 s default idle window for the
+  contrast with D to mean anything.
+
+`GOOSE_DISABLE_SESSION_NAMING=true` is set too, so each case measures exactly
+one stream: otherwise goose also spawns a background "name this session" request
+(`agent.rs` → `session_manager::maybe_update_name`) that opens a second
+concurrent connection to the mock and logs its own `llm_request` file.
+
+Case B is the one that matters. Case A alone proves nothing: "the 17 s prefill
 succeeded" is also what you would see if the timeout were simply removed. B
-reruns the identical scenario with the budget forced down to 5 s and requires it
-to fail, naming 5 s — so the timer is demonstrably live in A, and A is a real
+reruns the identical scenario with the budget forced down to 2 s and requires it
+to fail, naming 2 s — so the timer is demonstrably live in A, and A is a real
 measurement rather than an absence of one.
 
 Case C goes further and shows a *provider-level* override reaching the timer,
@@ -368,8 +419,11 @@ reports the inter-chunk error.
 
 Cases A–D mirror the unit tests above at the HTTP level; E and F cannot, because
 the thing they test is a property of HTTP framing (where the headers end) that a
-unit test operating on a `Stream` never sees. If you ever trim this file, keep B
-(the counter-measurement) and E/F (the boundary) and drop A, C and D first.
+unit test operating on a `Stream` never sees. C is now the most redundant of the
+six (it asserts the same message as B, only reaching the timer through a
+provider-level override rather than an environment variable), and D's
+message-routing claim is close behind it. If you trim, drop C and D first; A and
+B only mean something as a pair, and E/F have no substitute anywhere else.
 
 ### Known limit: the budget cannot see time-to-first-token
 
@@ -389,7 +443,7 @@ byte separately:
 The headers and the first byte arrive in the same instant, so the window is
 empty by construction. Accordingly, six runs with
 `GOOSE_INFERENCE_FIRST_LINE_TIMEOUT_SECS=1` all succeeded — the knob had no
-effect. Cases E and F pin the boundary down: identical 6 s of silence, differing
+effect. Cases E and F pin the boundary down: identical 2 s of silence, differing
 only in whether it falls before or after the headers, with the same 1 s budget.
 E fires; F does not.
 
