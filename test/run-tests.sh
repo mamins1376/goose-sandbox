@@ -11,9 +11,13 @@
 # run.sh.
 #
 # What it establishes:
-#   A  a 17 s prefill succeeds on defaults      -> the fix works
-#   B  the SAME 17 s prefill fails when the      -> the budget is actually live,
-#      first-line budget is lowered to 2 s          so A is a real measurement
+#   A  a 3 s prefill succeeds against a 1 s    -> the first-line budget is a
+#      inter-chunk window                           window of its own: the gap
+#                                                   between headers and the first
+#                                                   line is not charged to the
+#                                                   chunk budget
+#   B  the SAME 3 s prefill fails when the      -> the budget is actually live,
+#      first-line budget is lowered to 2 s         so A is a real measurement
 #      and the error names 2 s
 #   C  a provider-level override of 1 s reaches  -> per-provider config works
 #      the timer and is named in the error
@@ -45,8 +49,8 @@
 #     out case costs 4x budget (the retries), so the budget is the multiplier;
 #     each one just has to sit below the delay it is meant to catch. Keep them
 #     at 1 s or above -- below that this measures the scheduler, not goose. And
-#     do not take A below 16 s: it must stay above the 15 s default idle window
-#     for the contrast with D to mean anything.
+#     A's prefill must exceed the chunk window pinned on its provider (1 s), or
+#     it stops being a test of a slow-but-healthy prefill at all.
 #
 # GOOSE_DISABLE_SESSION_NAMING is set so each case measures exactly ONE stream.
 # Otherwise goose also spawns a background "name this session" request
@@ -57,7 +61,7 @@ cd "$(dirname "$0")" || exit 1
 
 IMAGE="${GOOSE_IMAGE:-localhost/goose-custom:a5baa00712}"
 ENGINE="${CONTAINER_ENGINE:-podman}"
-SLOW_PORT=8201   # 17 s prefill
+SLOW_PORT=8201   # 3 s prefill, 1 s chunk window
 FAST_PORT=8202   # never sends anything
 DEAD_PORT=8203   # one chunk, then silence
 PRE_PORT=8205    # 2 s delay AFTER headers
@@ -92,7 +96,7 @@ provider() { # name port [extra json fields]
 EOF
 }
 
-provider mockslow     "$SLOW_PORT"
+provider mockslow     "$SLOW_PORT" '"stream_chunk_timeout_secs": 1'
 provider mockfastline "$FAST_PORT" '"stream_first_line_timeout_secs": 1'
 provider mockdead     "$DEAD_PORT" '"stream_chunk_timeout_secs": 3'
 provider mockpre2     "$PRE_PORT"  '"stream_first_line_timeout_secs": 1'
@@ -111,7 +115,7 @@ providers:
 EOF
 
 echo "==> starting mock providers"
-python3 mock_sse.py slow-prefill    "$SLOW_PORT" 17 & pids+=($!)
+python3 mock_sse.py slow-prefill    "$SLOW_PORT" 3  & pids+=($!)
 python3 mock_sse.py dead-from-start "$FAST_PORT"    & pids+=($!)
 python3 mock_sse.py dead-midstream  "$DEAD_PORT"    & pids+=($!)
 python3 mock_sse.py slow-prefill    "$PRE_PORT" 2   & pids+=($!)
@@ -185,10 +189,10 @@ check_absent() { # label haystack needle
 out_of() { cat "$OUT/$1.out"; }
 timing_of() { cat "$OUT/$1.err"; }
 
-echo "==> A: 17 s prefill, default budgets (expect success)"; timing_of A
+echo "==> A: 3 s prefill, 1 s chunk window (expect success)"; timing_of A
 check "slow prefill survives" "$(out_of A)" "hello world"
 
-echo "==> B: same 17 s prefill, first-line budget forced to 2 s (expect failure naming 2s)"; timing_of B
+echo "==> B: same 3 s prefill, first-line budget forced to 2 s (expect failure naming 2s)"; timing_of B
 check "budget is live" "$(out_of B)" "no response within 2s"
 
 echo "==> C: provider-level override stream_first_line_timeout_secs=1 (expect failure naming 1s)"; timing_of C

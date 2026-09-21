@@ -351,36 +351,37 @@ cd test && ./run-tests.sh
 
 ```
 ==> running A-F in parallel (each case is one container)
-==> A: 17 s prefill, default budgets (expect success)
-      [mockslow: 17s]
+==> A: 3 s prefill, 1 s chunk window (expect success)
+      [mockslow: 4s]
   PASS  slow prefill survives
-==> B: same 17 s prefill, first-line budget forced to 2 s (expect failure naming 2s)
-      [mockslow: 8s]
+==> B: same 3 s prefill, first-line budget forced to 2 s (expect failure naming 2s)
+      [mockslow: 9s]
   PASS  budget is live
 ==> C: provider-level override stream_first_line_timeout_secs=1 (expect failure naming 1s)
-      [mockfastline: 4s]
+      [mockfastline: 5s]
   PASS  per-provider override reaches the timer
 ==> D: stall after the first chunk, 3 s window (expect the idle message, not the prefill one)
-      [mockdead: 3s]
+      [mockdead: 4s]
   PASS  idle window unchanged
 ==> E: 2 s of silence AFTER the headers, budget 1 s (expect the timer to fire)
-      [mockpre2: 4s]
+      [mockpre2: 5s]
   PASS  silence after headers is measured
 ==> F: the SAME 2 s of silence BEFORE the headers, budget 1 s (expect it to be invisible)
-      [mockhdr2: 2s]
+      [mockhdr2: 3s]
   PASS  silence before headers is NOT measured
   PASS    ...and the request still completes
 
 7 passed, 0 failed
-total wall clock: 17s
+total wall clock: 9s
 ```
 
 The per-case lines overlap — the six cases run at once — so only the total is
-wall clock.
+wall clock. The critical path is now B: a failing first-line case costs four
+attempts of its budget, so 2 s + startup is the slowest thing here.
 
 ### Why the suite is fast, and what it costs
 
-An earlier revision of this script took 101 s. Three changes brought it to ~17 s
+An earlier revision of this script took 101 s. A few changes brought it to ~9 s
 without touching a single assertion:
 
 - **The cases run in parallel.** They were always independent — own port, own
@@ -388,7 +389,8 @@ without touching a single assertion:
   the suite costs `max(case)` rather than `sum(case)`. The price is that the
   per-case timings are no longer additive and that the tiny budgets sit on a
   busier host; if you ever see a one-second budget flap, raise it rather than
-  blaming goose.
+  blaming goose. It also moves the target: only the longest case matters now, so
+  trimming a redundant case buys nothing.
 - **`GOOSE_PROVIDER_SKIP_BACKOFF=true`.** A first-line timeout is a
   `ProviderError::NetworkError` raised before the stream's first item, so
   `agents/reply_parts.rs` retries it — `RetryConfig::default()` is 3 retries with
@@ -398,20 +400,28 @@ without touching a single assertion:
 - **The budgets and mock delays are as small as still discriminating.** A
   timed-out case costs 4 × budget, so the budget *is* the multiplier; each one
   only has to sit below the delay it is meant to catch. Keep them at 1 s or
-  above — below that you are measuring the scheduler, not goose — and do not take
-  A below 16 s, because it must stay above the 15 s default idle window for the
-  contrast with D to mean anything.
+  above — below that you are measuring the scheduler, not goose.
+- **A pins its own chunk window.** A used to lean on the 15 s default and
+  therefore had to sleep longer than it. Pinning `stream_chunk_timeout_secs: 1`
+  on that provider lets a 3 s prefill make the same point in 4 s instead of
+  17 s — and makes it more sharply, because the gap now demonstrably survives a
+  window that would certainly have killed it had the two budgets been shared.
+  The 15 s default is not lost: it is asserted in `stream_util.rs`
+  (`assert_eq!(DEFAULT_CHUNK_TIMEOUT_SECS, 15)`).
 
 `GOOSE_DISABLE_SESSION_NAMING=true` is set too, so each case measures exactly
 one stream: otherwise goose also spawns a background "name this session" request
 (`agent.rs` → `session_manager::maybe_update_name`) that opens a second
 concurrent connection to the mock and logs its own `llm_request` file.
 
-Case B is the one that matters. Case A alone proves nothing: "the 17 s prefill
+Case B is the one that matters. Case A alone proves nothing: "the 3 s prefill
 succeeded" is also what you would see if the timeout were simply removed. B
 reruns the identical scenario with the budget forced down to 2 s and requires it
 to fail, naming 2 s — so the timer is demonstrably live in A, and A is a real
-measurement rather than an absence of one.
+measurement rather than an absence of one. A is also the sharper of the two on
+its own terms: its provider pins the inter-chunk window to 1 s, so a 3 s gap
+between the headers and the first line survives a window that would have killed
+it outright if the first-line budget were not separate.
 
 Case C goes further and shows a *provider-level* override reaching the timer,
 and D confirms the untidy half did not regress: a stall after output still
